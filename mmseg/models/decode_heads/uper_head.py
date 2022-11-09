@@ -81,7 +81,6 @@ class UPerHead(BaseDecodeHead):
         psp_outs.extend(self.psp_modules(x))
         psp_outs = torch.cat(psp_outs, dim=1)
         output = self.bottleneck(psp_outs)
-
         return output
 
     def _forward_feature(self, inputs):
@@ -96,15 +95,15 @@ class UPerHead(BaseDecodeHead):
                 H, W) which is feature map for last layer of decoder head.
         """
         inputs = self._transform_inputs(inputs)
-
+        
         # build laterals
         laterals = [
             lateral_conv(inputs[i])
             for i, lateral_conv in enumerate(self.lateral_convs)
         ]
-
+        
         laterals.append(self.psp_forward(inputs))
-
+        
         # build top-down path
         used_backbone_levels = len(laterals)
         for i in range(used_backbone_levels - 1, 0, -1):
@@ -120,6 +119,7 @@ class UPerHead(BaseDecodeHead):
             self.fpn_convs[i](laterals[i])
             for i in range(used_backbone_levels - 1)
         ]
+        
         # append psp feature
         fpn_outs.append(laterals[-1])
 

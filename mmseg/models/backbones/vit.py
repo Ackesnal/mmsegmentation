@@ -108,12 +108,17 @@ class TransformerEncoderLayer(BaseModule):
     def norm2(self):
         return getattr(self, self.norm2_name)
 
-    def forward(self, x):
-
+    def forward(self, x, idle=False):
+        
         def _inner_forward(x):
-            x = self.attn(self.norm1(x), identity=x)
-            x = self.ffn(self.norm2(x), identity=x)
-            return x
+            if not idle:
+                x = self.attn(self.norm1(x), identity=x)
+                x = self.ffn(self.norm2(x), identity=x)
+                return x
+            else:
+                x, attn_output_weights, attn_mask = self.attn(self.norm1(x), identity=x, idle=True)
+                x = self.ffn(self.norm2(x), identity=x, mask=attn_mask)
+                return x
 
         if self.with_cp and x.requires_grad:
             x = cp.checkpoint(_inner_forward, x)
@@ -385,7 +390,7 @@ class VisionTransformer(BaseModule):
             torch.Tensor: The resized pos_embed of shape [B, L_new, C]
         """
         assert pos_embed.ndim == 3, 'shape of pos_embed must be [B, L, C]'
-        pos_h, pos_w = pos_shape
+        pos_h, pos_w = pos_shape 
         # keep dim for easy deployment
         cls_token_weight = pos_embed[:, 0:1]
         pos_embed_weight = pos_embed[:, (-1 * pos_h * pos_w):]
@@ -413,7 +418,10 @@ class VisionTransformer(BaseModule):
 
         outs = []
         for i, layer in enumerate(self.layers):
-            x = layer(x)
+            if i < 3:
+                x = layer(x)
+            else:
+                x = layer(x, idle=True)
             if i == len(self.layers) - 1:
                 if self.final_norm:
                     x = self.norm1(x)

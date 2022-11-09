@@ -79,13 +79,13 @@ class MixFFN(BaseModule):
         self.dropout_layer = build_dropout(
             dropout_layer) if dropout_layer else torch.nn.Identity()
 
-    def forward(self, x, hw_shape, identity=None):
+    def forward(self, x, hw_shape, identity=None, mask=None):
         out = nlc_to_nchw(x, hw_shape)
         out = self.layers(out)
         out = nchw_to_nlc(out)
         if identity is None:
             identity = x
-        return identity + self.dropout_layer(out)
+        return identity + self.dropout_layer(out) if mask is None else identity + self.dropout_layer(out) * mask
 
 
 class EfficientMultiheadAttention(MultiheadAttention):
@@ -154,7 +154,7 @@ class EfficientMultiheadAttention(MultiheadAttention):
                           'future. Please upgrade your mmcv.')
             self.forward = self.legacy_forward
 
-    def forward(self, x, hw_shape, identity=None):
+    def forward(self, x, hw_shape, identity=None, idle=False):
 
         x_q = x
         if self.sr_ratio > 1:
@@ -178,12 +178,28 @@ class EfficientMultiheadAttention(MultiheadAttention):
             x_q = x_q.transpose(0, 1)
             x_kv = x_kv.transpose(0, 1)
 
-        out = self.attn(query=x_q, key=x_kv, value=x_kv)[0]
-
+        # out = self.attn(query=x_q, key=x_kv, value=x_kv)[0]
+        out, attn_output_weights, top_attn = self.attn(query=x_q,
+                                                       key=x_kv,
+                                                       value=x_kv,
+                                                       idle=idle)
+        
+        
         if self.batch_first:
             out = out.transpose(0, 1)
-
-        return identity + self.dropout_layer(self.proj_drop(out))
+        
+        if idle:
+            B, N, _ = out.shape
+            attn_mask = torch.zeros((B, N), dtype = attn_output_weights.dtype, device = attn_output_weights.device)  # B, N
+            dim1 = torch.arange(B, dtype = top_attn.dtype).reshape(-1,1).expand(B, int(N*0.6)+1).reshape(-1) # B*(K+1)
+            dim2 = top_attn.reshape(-1) # B*(K+1)
+            attn_mask[dim1, dim2] = 1.0
+            attn_mask = attn_mask.reshape(B,N,1)
+            attn_mask.requires_grad = False
+        if idle:
+            return identity + self.dropout_layer(self.proj_drop(out))*attn_mask, attn_output_weights, attn_mask
+        else:
+            return identity + self.dropout_layer(self.proj_drop(out))
 
     def legacy_forward(self, x, hw_shape, identity=None):
         """multi head attention forward in mmcv version < 1.3.17."""
@@ -281,12 +297,17 @@ class TransformerEncoderLayer(BaseModule):
 
         self.with_cp = with_cp
 
-    def forward(self, x, hw_shape):
+    def forward(self, x, hw_shape, idle=False):
 
         def _inner_forward(x):
-            x = self.attn(self.norm1(x), hw_shape, identity=x)
-            x = self.ffn(self.norm2(x), hw_shape, identity=x)
-            return x
+            if not idle:
+                x = self.attn(self.norm1(x), hw_shape, identity=x)
+                x = self.ffn(self.norm2(x), hw_shape, identity=x)
+                return x
+            else:
+                x, attn_output_weights, attn_mask = self.attn(self.norm1(x), hw_shape, identity=x, idle=True)
+                x = self.ffn(self.norm2(x), hw_shape, identity=x, mask=attn_mask)
+                return x
 
         if self.with_cp and x.requires_grad:
             x = cp.checkpoint(_inner_forward, x)
@@ -378,7 +399,8 @@ class MixVisionTransformer(BaseModule):
         self.with_cp = with_cp
         assert num_stages == len(num_layers) == len(num_heads) \
                == len(patch_sizes) == len(strides) == len(sr_ratios)
-
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dims))
+        
         self.out_indices = out_indices
         assert max(out_indices) < self.num_stages
 
@@ -440,8 +462,11 @@ class MixVisionTransformer(BaseModule):
 
         for i, layer in enumerate(self.layers):
             x, hw_shape = layer[0](x)
-            for block in layer[1]:
-                x = block(x, hw_shape)
+            for j, block in enumerate(layer[1]):
+                if i > 2:
+                    x = block(x, hw_shape, idle=True)
+                else:
+                    x = block(x, hw_shape)
             x = layer[2](x)
             x = nlc_to_nchw(x, hw_shape)
             if i in self.out_indices:
